@@ -1,12 +1,14 @@
+import logging
 import os
 from contextlib import closing
+from html import escape
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance, UnidentifiedImageError
 import gradio as gr
 
-from modules import images
+from modules import images, regional_inpainting
 from modules.infotext_utils import create_override_settings_dict, parse_generation_parameters
 from modules.processing import Processed, StableDiffusionProcessingImg2Img, process_images
 from modules.shared import opts, state
@@ -15,6 +17,116 @@ import modules.shared as shared
 import modules.processing as processing
 from modules.ui import plaintext_to_html
 import modules.scripts
+
+
+def _region_file_path(file):
+    if isinstance(file, str):
+        return file
+    path = getattr(file, "name", None)
+    if path:
+        return path
+    raise regional_inpainting.RegionInputError(
+        f"Invalid uploaded region mask {file!r}: expected a file path from the UI."
+    )
+
+
+def load_inpaint_regions(region_files, region_weights, region_feathers, region_seeds):
+    """Build validated regions from the img2img UI controls."""
+
+    files = list(region_files or [])
+    weights = regional_inpainting.parse_region_values(region_weights, len(files), 1.0, "region weights")
+    feathers = regional_inpainting.parse_region_values(region_feathers, len(files), 0.0, "region feather values")
+    seeds = regional_inpainting.parse_region_values(region_seeds, len(files), -1, "region seeds")
+
+    regions = []
+    for index, (file, weight, feather, seed) in enumerate(zip(files, weights, feathers, seeds)):
+        path = _region_file_path(file)
+        try:
+            mask = images.read(path)
+        except Exception as exc:
+            raise regional_inpainting.RegionInputError(
+                f"Failed to read inpaint region {index} mask {path!r}: {exc}"
+            ) from exc
+        try:
+            regions.append(
+                regional_inpainting.InpaintRegion(
+                    mask=mask,
+                    weight=float(weight),
+                    feather=float(feather),
+                    seed=int(seed),
+                    name=os.path.basename(path),
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise regional_inpainting.RegionInputError(
+                f"Invalid inpaint region {index} from {path!r} "
+                f"(weight={weight!r}, feather={feather!r}, seed={seed!r}): {exc}"
+            ) from exc
+    return regions
+
+
+def _inpaint_preview_source(mode, init_img, sketch, init_img_with_mask, inpaint_color_sketch, inpaint_color_sketch_orig, mask_alpha, init_img_inpaint, init_mask_inpaint):
+    mode = int(mode) if mode is not None else 0
+    if mode == 2 and isinstance(init_img_with_mask, dict):
+        return init_img_with_mask.get("image"), init_img_with_mask.get("mask")
+    if mode == 3:
+        image = inpaint_color_sketch
+        original = inpaint_color_sketch_orig or inpaint_color_sketch
+        if image is None or original is None:
+            return image, None
+        difference = np.any(np.array(image) != np.array(original), axis=-1)
+        mask = Image.fromarray(difference.astype(np.uint8) * 255, "L")
+        mask = ImageEnhance.Brightness(mask).enhance(1 - float(mask_alpha or 0) / 100)
+        return image, mask
+    if mode == 4:
+        return init_img_inpaint, init_mask_inpaint
+    if mode in (0, 1):
+        return init_img if mode == 0 else sketch, None
+    raise regional_inpainting.RegionInputError(
+        f"Cannot preview inpainting regions for tab {mode}: select Inpaint, Inpaint sketch or Inpaint upload."
+    )
+
+
+def preview_inpaint_regions(mode, init_img, sketch, init_img_with_mask, inpaint_color_sketch, inpaint_color_sketch_orig, mask_blur, mask_alpha, inpainting_mask_invert, init_img_inpaint, init_mask_inpaint, region_files, region_weights, region_feathers, region_seeds):
+    """Gradio callback for the multi-region mask preview."""
+
+    try:
+        image, mask = _inpaint_preview_source(
+            mode,
+            init_img,
+            sketch,
+            init_img_with_mask,
+            inpaint_color_sketch,
+            inpaint_color_sketch_orig,
+            mask_alpha,
+            init_img_inpaint,
+            init_mask_inpaint,
+        )
+        if image is None:
+            raise regional_inpainting.RegionInputError(
+                "Cannot preview inpainting regions: no source image is selected."
+            )
+        regions = load_inpaint_regions(region_files, region_weights, region_feathers, region_seeds)
+        if mask is None and not regions:
+            raise regional_inpainting.RegionInputError(
+                "Cannot preview inpainting regions: no mask was drawn or uploaded."
+            )
+
+        merged, regions = regional_inpainting.merge_region_masks(
+            mask,
+            regions,
+            size=image.size,
+            invert=bool(inpainting_mask_invert),
+        )
+        if mask_blur and float(mask_blur) > 0:
+            merged = merged.filter(ImageFilter.GaussianBlur(radius=float(mask_blur)))
+        preview = regional_inpainting.render_preview(image, merged)
+        return preview, f"Previewing {len(regions)} extra region(s); legacy mask: {'yes' if mask is not None else 'no'}."
+    except regional_inpainting.RegionInputError as exc:
+        return None, escape(f"Region preview failed. Inputs: tab={mode!r}, region_count={len(region_files or [])}. Details: {exc}")
+    except Exception as exc:
+        logging.exception("Unexpected failure while previewing multi-region inpaint masks.")
+        return None, escape(f"Region preview failed at preview_inpaint_regions. Inputs: tab={mode!r}, region_count={len(region_files or [])}. Details: {exc}")
 
 
 def process_batch(p, input, output_dir, inpaint_mask_dir, args, to_scale=False, scale_by=1.0, use_png_info=False, png_info_props=None, png_info_dir=None):
@@ -149,7 +261,7 @@ def process_batch(p, input, output_dir, inpaint_mask_dir, args, to_scale=False, 
     return batch_results
 
 
-def img2img(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, init_img_with_mask, inpaint_color_sketch, inpaint_color_sketch_orig, init_img_inpaint, init_mask_inpaint, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, *args):
+def img2img(id_task: str, request: gr.Request, mode: int, prompt: str, negative_prompt: str, prompt_styles, init_img, sketch, init_img_with_mask, inpaint_color_sketch, inpaint_color_sketch_orig, init_img_inpaint, init_mask_inpaint, mask_blur: int, mask_alpha: float, inpainting_fill: int, n_iter: int, batch_size: int, cfg_scale: float, image_cfg_scale: float, denoising_strength: float, selected_scale_tab: int, height: int, width: int, scale_by: float, resize_mode: int, inpaint_full_res: bool, inpaint_full_res_padding: int, inpainting_mask_invert: int, img2img_batch_input_dir: str, img2img_batch_output_dir: str, img2img_batch_inpaint_mask_dir: str, override_settings_texts, img2img_batch_use_png_info: bool, img2img_batch_png_info_props: list, img2img_batch_png_info_dir: str, img2img_batch_source_type: str, img2img_batch_upload: list, region_files=None, region_weights=None, region_feathers=None, region_seeds=None, *args):
     override_settings = create_override_settings_dict(override_settings_texts)
 
     is_batch = mode == 5
@@ -181,6 +293,18 @@ def img2img(id_task: str, request: gr.Request, mode: int, prompt: str, negative_
     image = images.fix_image(image)
     mask = images.fix_image(mask)
 
+    if region_files or region_weights or region_feathers or region_seeds:
+        try:
+            inpaint_regions = load_inpaint_regions(region_files, region_weights, region_feathers, region_seeds)
+        except regional_inpainting.RegionInputError as exc:
+            raise ValueError(
+                f"Invalid multi-region inpainting request in img2img (mode={mode}, "
+                f"region_count={len(region_files or [])}, weights={region_weights!r}, "
+                f"feather={region_feathers!r}, seeds={region_seeds!r}). Details: {exc}"
+            ) from exc
+    else:
+        inpaint_regions = None
+
     if selected_scale_tab == 1 and not is_batch:
         assert image, "Can't scale by because no image is selected"
 
@@ -211,6 +335,7 @@ def img2img(id_task: str, request: gr.Request, mode: int, prompt: str, negative_
         inpaint_full_res=inpaint_full_res,
         inpaint_full_res_padding=inpaint_full_res_padding,
         inpainting_mask_invert=inpainting_mask_invert,
+        inpaint_regions=inpaint_regions,
         override_settings=override_settings,
     )
 

@@ -16,7 +16,7 @@ from skimage import exposure
 from typing import Any
 
 import modules.sd_hijack
-from modules import devices, prompt_parser, masking, sd_samplers, lowvram, infotext_utils, extra_networks, sd_vae_approx, scripts, sd_samplers_common, sd_unet, errors, rng, profiling
+from modules import devices, prompt_parser, masking, sd_samplers, lowvram, infotext_utils, extra_networks, sd_vae_approx, scripts, sd_samplers_common, sd_unet, errors, rng, profiling, regional_inpainting
 from modules.rng import slerp # noqa: F401
 from modules.sd_hijack import model_hijack
 from modules.sd_samplers_common import images_tensor_to_samples, decode_first_stage, approximation_indexes
@@ -1052,7 +1052,8 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
 
                 mask_for_overlay = getattr(p, "mask_for_overlay", None)
 
-                if not shared.opts.overlay_inpaint:
+                force_region_overlay = bool(getattr(p, "inpaint_regions", None))
+                if not shared.opts.overlay_inpaint and not force_region_overlay:
                     overlay_image = None
                 elif getattr(p, "overlay_images", None) is not None and i < len(p.overlay_images):
                     overlay_image = p.overlay_images[i]
@@ -1128,6 +1129,9 @@ def process_images_inner(p: StableDiffusionProcessing) -> Processed:
                 index_of_first_image = 1
             if opts.grid_save:
                 images.save_image(grid, p.outpath_grids, "grid", p.all_seeds[0], p.all_prompts[0], opts.grid_format, info=infotext(use_main_prompt=True), short_filename=not opts.grid_extended_filename, p=p, grid=True)
+
+        if getattr(p, "return_region_preview", False) and getattr(p, "region_preview_image", None) is not None:
+            output_images.append(p.region_preview_image.copy())
 
     if not p.disable_extra_networks and p.extra_network_data:
         extra_networks.deactivate(p, p.extra_network_data)
@@ -1571,6 +1575,8 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
     initial_noise_multiplier: float = None
     latent_mask: Image = None
     force_task_id: str = None
+    inpaint_regions: list = None
+    return_region_preview: bool = False
 
     image_mask: Any = field(default=None, init=False)
 
@@ -1579,6 +1585,8 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
     init_img_hash: str = field(default=None, init=False)
     mask_for_overlay: Image = field(default=None, init=False)
     init_latent: torch.Tensor = field(default=None, init=False)
+    region_source_size: tuple = field(default=None, init=False)
+    region_preview_image: Image = field(default=None, init=False)
 
     def __post_init__(self):
         super().__post_init__()
@@ -1609,10 +1617,33 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
 
         image_mask = self.image_mask
 
-        if image_mask is not None:
-            # image_mask is passed in as RGBA by Gradio to support alpha masks,
-            # but we still want to support binary masks.
-            image_mask = create_binary_mask(image_mask, round=self.mask_round)
+        if image_mask is not None or self.inpaint_regions:
+            mask_round_for_base = self.mask_round
+            if image_mask is not None:
+                # image_mask is passed in as RGBA by Gradio to support alpha masks,
+                # but we still want to support binary masks.
+                image_mask = create_binary_mask(image_mask, round=mask_round_for_base)
+
+            if self.inpaint_regions:
+                try:
+                    image_mask, self.inpaint_regions = regional_inpainting.merge_region_masks(
+                        image_mask,
+                        self.inpaint_regions,
+                        invert=False,
+                        round_base=mask_round_for_base,
+                    )
+                except regional_inpainting.RegionInputError as exc:
+                    raise ValueError(
+                        "Invalid multi-region inpainting input. "
+                        f"Base mask: {'present' if image_mask is not None else 'absent'}; "
+                        f"regions: {len(self.inpaint_regions) if isinstance(self.inpaint_regions, (list, tuple)) else self.inpaint_regions!r}. "
+                        f"Failure location: StableDiffusionProcessingImg2Img.init mask merge. Details: {exc}"
+                    ) from exc
+                # Weighted and feathered regions must keep their alpha in latent
+                # space. The legacy single-mask path retains its rounding behavior.
+                self.mask_round = False
+                self.region_source_size = image_mask.size
+                self.extra_generation_params.update(regional_inpainting.describe_regions(self.inpaint_regions))
 
             if self.inpainting_mask_invert:
                 image_mask = ImageOps.invert(image_mask)
@@ -1647,16 +1678,23 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
                     self.extra_generation_params["Masked area padding"] = self.inpaint_full_res_padding
                 else:
                     crop_region = None
-                    image_mask = None
-                    self.mask_for_overlay = None
                     self.inpaint_full_res = False
-                    massage = 'Unable to perform "Inpaint Only mask" because mask is blank, switch to img2img mode.'
+                    if self.inpaint_regions:
+                        massage = 'Multi-region inpaint mask is blank; generation will preserve the original image.'
+                    else:
+                        massage = 'Unable to perform "Inpaint Only mask" because mask is blank, switch to img2img mode.'
                     model_hijack.comments.append(massage)
                     logging.info(massage)
+                    if self.inpaint_regions:
+                        image_mask = images.resize_image(self.resize_mode, image_mask, self.width, self.height)
+                    else:
+                        image_mask = None
+                        self.mask_for_overlay = None
             else:
                 image_mask = images.resize_image(self.resize_mode, image_mask, self.width, self.height)
                 np_mask = np.array(image_mask)
-                np_mask = np.clip((np_mask.astype(np.float32)) * 2, 0, 255).astype(np.uint8)
+                if not self.inpaint_regions:
+                    np_mask = np.clip((np_mask.astype(np.float32)) * 2, 0, 255).astype(np.uint8)
                 self.mask_for_overlay = Image.fromarray(np_mask)
 
             self.overlay_images = []
@@ -1749,12 +1787,80 @@ class StableDiffusionProcessingImg2Img(StableDiffusionProcessing):
             if self.inpainting_fill == 2:
                 self.init_latent = self.init_latent * self.mask + create_random_tensors(self.init_latent.shape[1:], all_seeds[0:self.init_latent.shape[0]]) * self.nmask
                 self.extra_generation_params["Masked content"] = 'latent noise'
+                self.apply_regional_latent_noise(crop_region)
 
             elif self.inpainting_fill == 3:
                 self.init_latent = self.init_latent * self.mask
                 self.extra_generation_params["Masked content"] = 'latent nothing'
 
+        self.create_region_preview()
         self.image_conditioning = self.img2img_image_conditioning(image * 2 - 1, self.init_latent, image_mask, self.mask_round)
+
+    def get_region_latent_masks(self, crop_region):
+        if not self.inpaint_regions:
+            return []
+
+        latent_size = (self.init_latent.shape[3], self.init_latent.shape[2])
+        latent_masks = []
+        for region in self.inpaint_regions:
+            if region.weight == 0:
+                continue
+            mask = regional_inpainting.mask_to_grayscale(region.mask)
+            if self.region_source_size is not None:
+                mask = regional_inpainting.resize_mask(mask, self.region_source_size)
+            mask = regional_inpainting.feather_mask(mask, region.feather)
+            if self.inpainting_mask_invert:
+                mask = ImageOps.invert(mask)
+
+            if crop_region is not None:
+                mask = mask.crop(crop_region)
+                mask = images.resize_image(2, mask, self.width, self.height)
+            else:
+                mask = images.resize_image(self.resize_mode, mask, self.width, self.height)
+
+            mask = regional_inpainting.resize_mask(mask, latent_size)
+            alpha = np.asarray(mask, dtype=np.float32) / 255.0
+            latent_masks.append((alpha * region.weight, region.seed))
+        return latent_masks
+
+    def apply_regional_latent_noise(self, crop_region):
+        """Replace latent-noise fill inside regions that specify their own seed."""
+
+        region_masks = self.get_region_latent_masks(crop_region)
+        applied = 0
+        batch_size = self.init_latent.shape[0]
+        for alpha, seed in region_masks:
+            if seed is None or seed < 0:
+                continue
+
+            noise = regional_inpainting.seeded_latent_noise(seed, self.init_latent.shape[1:])
+            noise = torch.from_numpy(noise).to(shared.device, dtype=self.init_latent.dtype)
+            noise = noise.unsqueeze(0).repeat(batch_size, 1, 1, 1)
+            alpha_tensor = torch.from_numpy(alpha).to(shared.device, dtype=self.init_latent.dtype)
+            alpha_tensor = alpha_tensor.unsqueeze(0).unsqueeze(0).repeat(batch_size, self.init_latent.shape[1], 1, 1)
+            self.init_latent = self.init_latent * (1.0 - alpha_tensor) + noise * alpha_tensor
+            applied += 1
+
+        if applied:
+            self.extra_generation_params["Regional seeded noise"] = f"{applied} region(s)"
+
+    def create_region_preview(self):
+        if not self.return_region_preview or not self.inpaint_regions:
+            return
+        if self.mask_for_overlay is None:
+            return
+        if not self.init_images:
+            return
+
+        preview_image = images.flatten(self.init_images[0], opts.img2img_background_color).convert("RGB")
+        if preview_image.size != self.mask_for_overlay.size:
+            preview_image = images.resize_image(
+                self.resize_mode,
+                preview_image,
+                self.mask_for_overlay.width,
+                self.mask_for_overlay.height,
+            )
+        self.region_preview_image = regional_inpainting.render_preview(preview_image, self.mask_for_overlay)
 
     def sample(self, conditioning, unconditional_conditioning, seeds, subseeds, subseed_strength, prompts):
         x = self.rng.next()

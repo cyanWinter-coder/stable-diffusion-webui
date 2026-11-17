@@ -9,6 +9,7 @@ A web interface for Stable Diffusion, implemented using Gradio library.
 - One click install and run script (but you still must install python and git)
 - Outpainting
 - Inpainting
+- [Multi-region inpainting](docs/regional-inpainting.md) with weighted, feathered masks and deterministic seed control
 - Color Sketch
 - Prompt Matrix
 - Stable Diffusion Upscale

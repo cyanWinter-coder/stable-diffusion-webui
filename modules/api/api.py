@@ -17,7 +17,7 @@ from fastapi.encoders import jsonable_encoder
 from secrets import compare_digest
 
 import modules.shared as shared
-from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart, shared_items, script_callbacks, infotext_utils, sd_models, sd_schedulers
+from modules import sd_samplers, deepbooru, sd_hijack, images, scripts, ui, postprocessing, errors, restart, shared_items, script_callbacks, infotext_utils, sd_models, sd_schedulers, regional_inpainting
 from modules.api import models
 from modules.shared import opts
 from modules.processing import StableDiffusionProcessingTxt2Img, StableDiffusionProcessingImg2Img, process_images
@@ -500,6 +500,39 @@ class Api:
         if mask:
             mask = decode_base64_to_image(mask)
 
+        inpaint_regions = img2imgreq.inpaint_regions
+        if inpaint_regions:
+            decoded_regions = []
+            for index, region in enumerate(inpaint_regions):
+                if not isinstance(region, dict):
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Invalid inpaint_regions[{index}]: expected an object with mask, weight, feather and seed.",
+                    )
+                region = dict(region)
+                region_mask = region.get("mask", region.get("mask_image", region.get("image")))
+                if not isinstance(region_mask, str) or not region_mask.strip():
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Invalid inpaint_regions[{index}].mask: expected a base64 image string.",
+                    )
+                try:
+                    region["mask"] = decode_base64_to_image(region_mask)
+                except HTTPException as exc:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Invalid inpaint_regions[{index}].mask: could not decode the image ({exc.detail}).",
+                    ) from exc
+                decoded_regions.append(region)
+            try:
+                decoded_regions = regional_inpainting.normalize_regions(decoded_regions)
+            except regional_inpainting.RegionInputError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Invalid inpaint_regions: {exc}",
+                ) from exc
+            inpaint_regions = decoded_regions
+
         script_runner = scripts.scripts_img2img
 
         infotext_script_args = {}
@@ -513,6 +546,7 @@ class Api:
             "do_not_save_samples": not img2imgreq.save_images,
             "do_not_save_grid": not img2imgreq.save_images,
             "mask": mask,
+            "inpaint_regions": inpaint_regions,
         })
         if populate.sampler_name:
             populate.sampler_index = None  # prevent a warning later on

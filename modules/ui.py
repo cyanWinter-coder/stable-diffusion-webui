@@ -708,6 +708,41 @@ def create_ui():
                                 with gr.Column(scale=4):
                                     inpaint_full_res_padding = gr.Slider(label='Only masked padding, pixels', minimum=0, maximum=256, step=4, value=32, elem_id="img2img_inpaint_full_res_padding")
 
+                            with gr.Accordion("Multi-region inpaint", open=False):
+                                region_mask_files = gr.Files(
+                                    label="Additional region masks",
+                                    file_count="multiple",
+                                    file_types=["image"],
+                                    elem_id="img2img_region_mask_files",
+                                )
+                                gr.HTML(
+                                    "Masks are applied in upload order. RGBA masks use alpha; other masks use luminance. "
+                                    "Leave a list empty to use its default for every mask."
+                                )
+                                with FormRow():
+                                    region_weights = gr.Textbox(
+                                        label="Weights (0-1)",
+                                        placeholder="1.0, 0.8",
+                                        elem_id="img2img_region_weights",
+                                    )
+                                    region_feathers = gr.Textbox(
+                                        label="Feather (pixels)",
+                                        placeholder="4, 8",
+                                        elem_id="img2img_region_feathers",
+                                    )
+                                    region_seeds = gr.Textbox(
+                                        label="Latent noise seeds",
+                                        placeholder="-1, 1234",
+                                        elem_id="img2img_region_seeds",
+                                    )
+                                region_preview_button = gr.Button("Preview merged mask", elem_id="img2img_region_preview_button")
+                                region_preview_image = gr.Image(
+                                    label="Merged region preview",
+                                    interactive=False,
+                                    elem_id="img2img_region_preview_image",
+                                )
+                                region_preview_status = gr.HTML(elem_id="img2img_region_preview_status")
+
                     if category not in {"accordions"}:
                         scripts.scripts_img2img.setup_ui_for_section(category)
 
@@ -770,6 +805,10 @@ def create_ui():
                     img2img_batch_png_info_dir,
                     img2img_batch_source_type,
                     img2img_batch_upload,
+                    region_mask_files,
+                    region_weights,
+                    region_feathers,
+                    region_seeds,
                 ] + custom_inputs,
                 outputs=[
                     output_panel.gallery,
@@ -777,6 +816,29 @@ def create_ui():
                     output_panel.infotext,
                     output_panel.html_log,
                 ],
+                show_progress=False,
+            )
+
+            region_preview_button.click(
+                fn=modules.img2img.preview_inpaint_regions,
+                inputs=[
+                    img2img_selected_tab,
+                    init_img,
+                    sketch,
+                    init_img_with_mask,
+                    inpaint_color_sketch,
+                    inpaint_color_sketch_orig,
+                    mask_blur,
+                    mask_alpha,
+                    inpainting_mask_invert,
+                    init_img_inpaint,
+                    init_mask_inpaint,
+                    region_mask_files,
+                    region_weights,
+                    region_feathers,
+                    region_seeds,
+                ],
+                outputs=[region_preview_image, region_preview_status],
                 show_progress=False,
             )
 
